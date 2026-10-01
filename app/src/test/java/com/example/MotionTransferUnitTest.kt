@@ -254,4 +254,88 @@ class MotionTransferUnitTest {
         // Verify NON-MONOTONIC curve (not a single positive zoom)
         assertTrue("Curve is non-monotonic", scale2s > scale4s && scale6s > scale4s && scale6s > scale8s)
     }
+
+    @Test
+    fun testCase1_referenceSingleZoomIn() {
+        // TEST 1: Reference has one zoom-in
+        val samples = listOf(
+            RawMotionSample(0L, 1.0f, 0.5f, 0.5f),
+            RawMotionSample(1000L, 1.2f, 0.5f, 0.5f),
+            RawMotionSample(2000L, 1.5f, 0.5f, 0.5f)
+        )
+        val kfs = KeyframeDetector.reconstructKeyframes(samples, 2000L)
+        val timeline = MotionTimeline(2000L, kfs, samples)
+        assertTrue(timeline.hasZoomIn)
+        val startScale = timeline.getTransformForOriginalTime(0L, 2000L, TimelineMappingMode.EXACT_TIME).scale
+        val endScale = timeline.getTransformForOriginalTime(2000L, 2000L, TimelineMappingMode.EXACT_TIME).scale
+        assertTrue("End scale must be greater than start scale", endScale > startScale + 0.4f)
+    }
+
+    @Test
+    fun testCase2_referenceSingleZoomOut() {
+        // TEST 2: Reference has one zoom-out
+        val samples = listOf(
+            RawMotionSample(0L, 1.6f, 0.5f, 0.5f),
+            RawMotionSample(1000L, 1.3f, 0.5f, 0.5f),
+            RawMotionSample(2000L, 1.0f, 0.5f, 0.5f)
+        )
+        val kfs = KeyframeDetector.reconstructKeyframes(samples, 2000L)
+        val timeline = MotionTimeline(2000L, kfs, samples)
+        assertTrue(timeline.hasZoomOut)
+        val startScale = timeline.getTransformForOriginalTime(0L, 2000L, TimelineMappingMode.EXACT_TIME).scale
+        val endScale = timeline.getTransformForOriginalTime(2000L, 2000L, TimelineMappingMode.EXACT_TIME).scale
+        assertTrue("Start scale must be greater than end scale", startScale > endScale + 0.4f)
+    }
+
+    @Test
+    fun testCase3_turningPointZoomInToZoomOut() {
+        // TEST 3: zoom-in -> turning point -> zoom-out
+        val samples = listOf(
+            RawMotionSample(0L, 1.0f, 0.5f, 0.5f),
+            RawMotionSample(1000L, 1.3f, 0.5f, 0.5f),
+            RawMotionSample(2000L, 1.6f, 0.5f, 0.5f), // Peak
+            RawMotionSample(3000L, 1.3f, 0.5f, 0.5f),
+            RawMotionSample(4000L, 1.0f, 0.5f, 0.5f)
+        )
+        val kfs = KeyframeDetector.reconstructKeyframes(samples, 4000L)
+        val timeline = MotionTimeline(4000L, kfs, samples)
+        assertTrue("Must detect peak zoom turning point", kfs.any { it.timestampMs in 1800L..2200L && it.scale >= 1.55f })
+        assertTrue(timeline.hasZoomIn)
+        assertTrue(timeline.hasZoomOut)
+    }
+
+    @Test
+    fun testCase5_lowMotionReference() {
+        // TEST 5: Reference has no meaningful camera motion
+        val staticSamples = listOf(
+            RawMotionSample(0L, 1.000f, 0.50f, 0.50f),
+            RawMotionSample(1000L, 1.002f, 0.50f, 0.50f),
+            RawMotionSample(2000L, 1.001f, 0.50f, 0.50f),
+            RawMotionSample(3000L, 1.000f, 0.50f, 0.50f)
+        )
+        val kfs = KeyframeDetector.reconstructKeyframes(staticSamples, 3000L)
+        val timeline = MotionTimeline(3000L, kfs, staticSamples)
+        val isStatic = (timeline.maxScale - timeline.minScale < 0.02f)
+        assertTrue("Static reference must be detected as low/no motion", isStatic)
+    }
+
+    @Test
+    fun testCase6_differentFpsTimeAlignment() {
+        // TEST 6: Continuous interpolation at arbitrary frame timestamps (e.g. 24 FPS vs 60 FPS)
+        val samples = listOf(
+            RawMotionSample(0L, 1.0f, 0.5f, 0.5f),
+            RawMotionSample(1000L, 1.4f, 0.6f, 0.4f),
+            RawMotionSample(2000L, 1.0f, 0.5f, 0.5f)
+        )
+        val timeline = MotionTimeline(2000L, emptyList(), samples)
+
+        // Query at 24 FPS frame timestamp (41.66ms) and 60 FPS timestamp (16.66ms)
+        val t16 = timeline.getTransformForOriginalTime(16L, 2000L, TimelineMappingMode.EXACT_TIME)
+        val t41 = timeline.getTransformForOriginalTime(41L, 2000L, TimelineMappingMode.EXACT_TIME)
+        val t500 = timeline.getTransformForOriginalTime(500L, 2000L, TimelineMappingMode.EXACT_TIME)
+
+        assertTrue(t16.scale in 1.0f..1.05f)
+        assertTrue(t41.scale in 1.0f..1.08f)
+        assertTrue(t500.scale in 1.15f..1.25f)
+    }
 }

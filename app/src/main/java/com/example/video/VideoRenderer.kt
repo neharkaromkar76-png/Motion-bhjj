@@ -129,7 +129,7 @@ object VideoRenderer {
         var inputDone = false
         var outputDone = false
 
-        val timeoutUs = 10_000L
+        val timeoutUs = 2500L
         val maxDurationUs = durationMs * 1000L
 
         try {

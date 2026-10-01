@@ -15,7 +15,9 @@ data class MotionSegment(
     val endMs: Long,
     val startScale: Float,
     val endScale: Float,
-    val direction: MotionDirection
+    val direction: MotionDirection,
+    val peakScale: Float = maxOf(startScale, endScale),
+    val confidence: Float = 1.0f
 ) {
     val durationMs: Long
         get() = (endMs - startMs).coerceAtLeast(0L)
@@ -23,14 +25,16 @@ data class MotionSegment(
 
 data class MotionTimeline(
     val referenceDurationMs: Long,
-    val keyframes: List<MotionKeyframe>
+    val keyframes: List<MotionKeyframe>,
+    val samples: List<RawMotionSample> = emptyList(),
+    val events: List<MotionSegment> = emptyList()
 ) {
     fun getTransformForOriginalTime(
         originalTimeMs: Long,
         originalDurationMs: Long,
         mappingMode: TimelineMappingMode
     ): MotionTransform {
-        if (keyframes.isEmpty()) {
+        if (samples.isEmpty() && keyframes.isEmpty()) {
             return MotionTransform(
                 timestampMs = originalTimeMs,
                 scale = 1.0f,
@@ -41,7 +45,7 @@ data class MotionTimeline(
         }
 
         val mappedReferenceTimeMs: Long = when {
-            // If durations are equal, always exact 1:1 mapping per requirement
+            // When durations are equal, use exact 1:1 mapping
             originalDurationMs == referenceDurationMs -> {
                 originalTimeMs.coerceIn(0L, referenceDurationMs)
             }
@@ -60,12 +64,19 @@ data class MotionTimeline(
             }
         }
 
-        val refTransform = MotionInterpolator.interpolate(keyframes, mappedReferenceTimeMs)
+        // Evaluate continuous motion samples if available, falling back to keyframe interpolation
+        val refTransform = if (samples.isNotEmpty()) {
+            MotionInterpolator.interpolateFromSamples(samples, mappedReferenceTimeMs)
+        } else {
+            MotionInterpolator.interpolate(keyframes, mappedReferenceTimeMs)
+        }
+
         return refTransform.copy(timestampMs = originalTimeMs)
     }
 
     val segments: List<MotionSegment>
         get() {
+            if (events.isNotEmpty()) return events
             if (keyframes.size < 2) return emptyList()
             val sorted = keyframes.sortedBy { it.timestampMs }
             val list = mutableListOf<MotionSegment>()
@@ -74,8 +85,8 @@ data class MotionTimeline(
                 val k1 = sorted[i + 1]
                 val deltaScale = k1.scale - k0.scale
                 val dir = when {
-                    deltaScale > 0.04f -> MotionDirection.ZOOM_IN
-                    deltaScale < -0.04f -> MotionDirection.ZOOM_OUT
+                    deltaScale > 0.03f -> MotionDirection.ZOOM_IN
+                    deltaScale < -0.03f -> MotionDirection.ZOOM_OUT
                     else -> MotionDirection.HOLD
                 }
                 list.add(
@@ -84,7 +95,8 @@ data class MotionTimeline(
                         endMs = k1.timestampMs,
                         startScale = k0.scale,
                         endScale = k1.scale,
-                        direction = dir
+                        direction = dir,
+                        peakScale = maxOf(k0.scale, k1.scale)
                     )
                 )
             }
@@ -97,10 +109,18 @@ data class MotionTimeline(
     }
 
     val maxScale: Float
-        get() = keyframes.maxOfOrNull { it.scale } ?: 1.0f
+        get() = if (samples.isNotEmpty()) {
+            samples.maxOfOrNull { it.scale } ?: (keyframes.maxOfOrNull { it.scale } ?: 1.0f)
+        } else {
+            keyframes.maxOfOrNull { it.scale } ?: 1.0f
+        }
 
     val minScale: Float
-        get() = keyframes.minOfOrNull { it.scale } ?: 1.0f
+        get() = if (samples.isNotEmpty()) {
+            samples.minOfOrNull { it.scale } ?: (keyframes.minOfOrNull { it.scale } ?: 1.0f)
+        } else {
+            keyframes.minOfOrNull { it.scale } ?: 1.0f
+        }
 
     val hasZoomIn: Boolean
         get() = segments.any { it.direction == MotionDirection.ZOOM_IN } || maxScale > 1.05f

@@ -144,7 +144,7 @@ class MotionTransferViewModel(application: Application) : AndroidViewModel(appli
             }
 
             try {
-                val extractedKeyframes = MotionAnalyzer.extractMotionKeyframesWithMediaExtractor(
+                val result = MotionAnalyzer.analyzeVideoMotion(
                     context = getApplication(),
                     referenceUri = ref.uri,
                     durationMs = ref.durationMs
@@ -154,15 +154,9 @@ class MotionTransferViewModel(application: Application) : AndroidViewModel(appli
                     }
                 }
 
-                val detectedKeyframes = KeyframeDetector.reconstructFromExtractedKeyframes(
-                    extractedKeyframes = extractedKeyframes,
-                    referenceDurationMs = ref.durationMs
-                )
-
-                val timeline = MotionTimeline(
-                    referenceDurationMs = ref.durationMs,
-                    keyframes = detectedKeyframes
-                )
+                val timeline = result.timeline
+                val detectedKeyframes = result.keyframes
+                val rawSamplesList = result.samples
 
                 val origDuration = _uiState.value.originalVideo?.durationMs ?: ref.durationMs
                 val initialTransform = timeline.getTransformForOriginalTime(
@@ -171,8 +165,10 @@ class MotionTransferViewModel(application: Application) : AndroidViewModel(appli
                     mappingMode = _uiState.value.mappingMode
                 )
 
-                val rawSamplesList = extractedKeyframes.map {
-                    com.example.video.RawMotionSample(it.timestampMs, it.scale, it.positionX, it.positionY)
+                val statusSummary = if (result.isStatic) {
+                    "Analyzed reference: static camera framing detected"
+                } else {
+                    "Motion blueprint ready: ${result.zoomInEventsCount} Zoom In, ${result.zoomOutEventsCount} Zoom Out events (${detectedKeyframes.size} keyframes across ${(ref.durationMs / 1000f).let { String.format(java.util.Locale.US, "%.1fs", it) }})"
                 }
 
                 _uiState.update {
@@ -185,7 +181,7 @@ class MotionTransferViewModel(application: Application) : AndroidViewModel(appli
                         motionTimeline = timeline,
                         currentTransform = initialTransform,
                         selectedKeyframe = detectedKeyframes.firstOrNull(),
-                        infoMessage = "Detected ${detectedKeyframes.size} motion keyframes across full timeline!"
+                        infoMessage = statusSummary
                     )
                 }
             } catch (e: CancellationException) {

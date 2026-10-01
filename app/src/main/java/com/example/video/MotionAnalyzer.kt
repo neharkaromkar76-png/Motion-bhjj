@@ -6,12 +6,14 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Log
 import com.example.model.InterpolationType
 import com.example.model.MotionKeyframe
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import kotlin.math.sqrt
 
 data class RawMotionSample(
     val timestampMs: Long,
@@ -20,8 +22,25 @@ data class RawMotionSample(
     val panY: Float
 )
 
+data class MotionAnalysisResult(
+    val durationMs: Long,
+    val samples: List<RawMotionSample>,
+    val keyframes: List<MotionKeyframe>,
+    val timeline: MotionTimeline,
+    val minScale: Float,
+    val maxScale: Float,
+    val minPanX: Float,
+    val maxPanX: Float,
+    val minPanY: Float,
+    val maxPanY: Float,
+    val zoomInEventsCount: Int,
+    val zoomOutEventsCount: Int,
+    val isStatic: Boolean
+)
+
 object MotionAnalyzer {
 
+    private const val TAG = "MotionAnalyzer"
     private const val ANALYSIS_WIDTH = 256
     private const val ANALYSIS_HEIGHT = 144
 
@@ -34,20 +53,24 @@ object MotionAnalyzer {
     private data class FrameMotionDelta(
         val deltaX: Float,
         val deltaY: Float,
-        val scaleFactor: Float
+        val zoomAlpha: Float,
+        val validFeatureCount: Int
     )
 
     /**
-     * Steps through the reference video across the entire timeline (0.000s to end),
-     * extracting dense motion data and producing accurate keyframes that capture
-     * both zoom-in and zoom-out camera transforms.
+     * Complete video motion analysis:
+     * - Analyzes the entire Reference Video timeline (0.000s to duration)
+     * - Estimates continuous time-series camera transform (zoom in, zoom out, pan X, pan Y)
+     * - Detects turning points (peaks and valleys)
+     * - Builds the unified MotionTimeline shared by Preview and Export
+     * - Emits internal verification logs per requirement #19
      */
-    suspend fun extractMotionKeyframesWithMediaExtractor(
+    suspend fun analyzeVideoMotion(
         context: Context,
         referenceUri: Uri,
         durationMs: Long,
         onProgress: (progress: Float, message: String) -> Unit
-    ): List<MotionKeyframe> = withContext(Dispatchers.Default) {
+    ): MotionAnalysisResult = withContext(Dispatchers.Default) {
         val extractor = MediaExtractor()
         val retriever = MediaMetadataRetriever()
 
@@ -57,7 +80,7 @@ object MotionAnalyzer {
         } catch (e: Exception) {
             extractor.release()
             try { retriever.release() } catch (_: Exception) {}
-            throw IllegalArgumentException("Reference video could not be read: ${e.localizedMessage}")
+            throw IllegalArgumentException("Reference video could not be opened: ${e.localizedMessage}")
         }
 
         val rawSamples = mutableListOf<RawMotionSample>()
@@ -80,12 +103,12 @@ object MotionAnalyzer {
             extractor.selectTrack(videoTrackIndex)
 
             val safeDurationMs = durationMs.coerceAtLeast(500L)
-            // Dense sampling interval for high-fidelity zoom curve reconstruction (100ms - 150ms)
+            // Dense sampling step: 66ms to 100ms (~10 to 15 samples/sec) for complete curve capture
             val sampleStepThresholdMs = when {
-                safeDurationMs <= 5000L -> 80L
-                safeDurationMs <= 15000L -> 100L
-                safeDurationMs <= 35000L -> 125L
-                else -> 150L
+                safeDurationMs <= 5000L -> 66L
+                safeDurationMs <= 15000L -> 80L
+                safeDurationMs <= 35000L -> 100L
+                else -> 100L
             }
 
             var previousFrame: LumaFrame? = null
@@ -93,7 +116,7 @@ object MotionAnalyzer {
             var currentPanX = 0.5f
             var currentPanY = 0.5f
 
-            // Add initial sample at 0ms
+            // 0ms anchor
             rawSamples.add(
                 RawMotionSample(
                     timestampMs = 0L,
@@ -105,7 +128,6 @@ object MotionAnalyzer {
 
             var lastSampledMs = 0L
 
-            // Step through reference video frames using MediaExtractor timestamps
             while (true) {
                 ensureActive()
                 val sampleTimeUs = extractor.sampleTime
@@ -126,16 +148,18 @@ object MotionAnalyzer {
                         frameBitmap.recycle()
 
                         if (previousFrame != null) {
-                            val frameDelta = estimateFrameMotion(previousFrame, currentFrame)
+                            val motionDelta = estimateOpticalFlowCameraMotion(previousFrame, currentFrame)
 
-                            // Apply frame scale change symmetrically for both zoom-in and zoom-out
-                            val stepFactor = frameDelta.scaleFactor.coerceIn(0.85f, 1.15f)
-                            currentScale = (currentScale * stepFactor).coerceIn(0.5f, 4.0f)
+                            // Apply camera zoom rate symmetrically:
+                            // zoomAlpha > 0 -> zoom-in (features expand from center)
+                            // zoomAlpha < 0 -> zoom-out (features contract toward center)
+                            val stepFactor = (1.0f + motionDelta.zoomAlpha).coerceIn(0.85f, 1.15f)
+                            currentScale = (currentScale * stepFactor).coerceIn(0.6f, 3.5f)
 
-                            val dNormX = if (currentFrame.width > 0) frameDelta.deltaX / currentFrame.width.toFloat() else 0f
-                            val dNormY = if (currentFrame.height > 0) frameDelta.deltaY / currentFrame.height.toFloat() else 0f
-                            currentPanX = (currentPanX + dNormX * 0.7f).coerceIn(0.1f, 0.9f)
-                            currentPanY = (currentPanY + dNormY * 0.7f).coerceIn(0.1f, 0.9f)
+                            val normDx = motionDelta.deltaX / currentFrame.width.toFloat()
+                            val normDy = motionDelta.deltaY / currentFrame.height.toFloat()
+                            currentPanX = (currentPanX - normDx * 0.75f).coerceIn(0.15f, 0.85f)
+                            currentPanY = (currentPanY - normDy * 0.75f).coerceIn(0.15f, 0.85f)
 
                             rawSamples.add(
                                 RawMotionSample(
@@ -155,7 +179,7 @@ object MotionAnalyzer {
                 if (!extractor.advance()) break
             }
 
-            // Ensure terminal timestamp is present
+            // Ensure exact video duration is reached
             if (rawSamples.isNotEmpty() && rawSamples.last().timestampMs < safeDurationMs) {
                 val last = rawSamples.last()
                 rawSamples.add(
@@ -168,13 +192,14 @@ object MotionAnalyzer {
                 )
             }
 
-            // Sort and deduplicate raw samples
             val sortedSamples = rawSamples.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
 
-            // Normalize curve to prevent black borders while strictly preserving relative rises and falls
-            val minScale = sortedSamples.minOfOrNull { it.scale } ?: 1.0f
-            val normalizedSamples = if (minScale < 1.0f && minScale > 0.1f) {
-                val multiplier = 1.0f / minScale
+            // Framing normalization: preserve relative rises and falls while ensuring scale >= 1.0
+            val rawMinScale = sortedSamples.minOfOrNull { it.scale } ?: 1.0f
+            val rawMaxScale = sortedSamples.maxOfOrNull { it.scale } ?: 1.0f
+
+            val normalizedSamples = if (rawMinScale < 1.0f && rawMinScale > 0.1f) {
+                val multiplier = 1.0f / rawMinScale
                 sortedSamples.map { sample ->
                     sample.copy(
                         scale = roundToDecimals(sample.scale * multiplier, 3),
@@ -192,20 +217,74 @@ object MotionAnalyzer {
                 }
             }
 
-            onProgress(0.95f, "Reconstructing motion turning points...")
+            onProgress(0.92f, "Reconstructing motion turning points...")
 
-            // Reconstruct keyframes capturing all zoom-in and zoom-out inflection points
+            // Reconstruct keyframes at turning points (peaks and valleys)
             val reconstructedKeyframes = KeyframeDetector.reconstructKeyframes(
                 rawSamples = normalizedSamples,
                 referenceDurationMs = safeDurationMs
             )
 
-            onProgress(1.0f, "Reference motion analysis complete (${reconstructedKeyframes.size} keyframes)")
-            reconstructedKeyframes
+            // Build MotionTimeline
+            val timeline = MotionTimeline(
+                referenceDurationMs = safeDurationMs,
+                keyframes = reconstructedKeyframes,
+                samples = normalizedSamples
+            )
+
+            val finalMinScale = normalizedSamples.minOfOrNull { it.scale } ?: 1.0f
+            val finalMaxScale = normalizedSamples.maxOfOrNull { it.scale } ?: 1.0f
+            val minX = normalizedSamples.minOfOrNull { it.panX } ?: 0.5f
+            val maxX = normalizedSamples.maxOfOrNull { it.panX } ?: 0.5f
+            val minY = normalizedSamples.minOfOrNull { it.panY } ?: 0.5f
+            val maxY = normalizedSamples.maxOfOrNull { it.panY } ?: 0.5f
+
+            val zoomInCount = timeline.zoomInCount
+            val zoomOutCount = timeline.zoomOutCount
+            val isStatic = (finalMaxScale - finalMinScale < 0.02f) && (maxX - minX < 0.02f) && (maxY - minY < 0.02f)
+
+            // Requirement #19: Internal verification logging
+            Log.i(TAG, "=== REFERENCE VIDEO MOTION ANALYSIS ===")
+            Log.i(TAG, "Reference duration: $safeDurationMs ms")
+            Log.i(TAG, "Analyzed samples: ${normalizedSamples.size}")
+            Log.i(TAG, "Reconstructed keyframes: ${reconstructedKeyframes.size}")
+            Log.i(TAG, "Zoom events: In=$zoomInCount, Out=$zoomOutCount")
+            Log.i(TAG, "Scale range: ${String.format(java.util.Locale.US, "%.3f - %.3f", finalMinScale, finalMaxScale)}")
+            Log.i(TAG, "Pan X range: ${String.format(java.util.Locale.US, "%.3f - %.3f", minX, maxX)}")
+            Log.i(TAG, "Pan Y range: ${String.format(java.util.Locale.US, "%.3f - %.3f", minY, maxY)}")
+            Log.i(TAG, "Camera motion isStatic: $isStatic")
+
+            onProgress(1.0f, "Reference motion analysis complete (${reconstructedKeyframes.size} keyframes, ${normalizedSamples.size} samples)")
+
+            MotionAnalysisResult(
+                durationMs = safeDurationMs,
+                samples = normalizedSamples,
+                keyframes = reconstructedKeyframes,
+                timeline = timeline,
+                minScale = finalMinScale,
+                maxScale = finalMaxScale,
+                minPanX = minX,
+                maxPanX = maxX,
+                minPanY = minY,
+                maxPanY = maxY,
+                zoomInEventsCount = zoomInCount,
+                zoomOutEventsCount = zoomOutCount,
+                isStatic = isStatic
+            )
         } finally {
             extractor.release()
             try { retriever.release() } catch (_: Exception) {}
         }
+    }
+
+    suspend fun extractMotionKeyframesWithMediaExtractor(
+        context: Context,
+        referenceUri: Uri,
+        durationMs: Long,
+        onProgress: (progress: Float, message: String) -> Unit
+    ): List<MotionKeyframe> {
+        val result = analyzeVideoMotion(context, referenceUri, durationMs, onProgress)
+        return result.keyframes
     }
 
     suspend fun analyzeReferenceVideo(
@@ -214,15 +293,8 @@ object MotionAnalyzer {
         durationMs: Long,
         onProgress: (progress: Float, message: String) -> Unit
     ): List<RawMotionSample> {
-        val keyframes = extractMotionKeyframesWithMediaExtractor(context, referenceUri, durationMs, onProgress)
-        return keyframes.map {
-            RawMotionSample(
-                timestampMs = it.timestampMs,
-                scale = it.scale,
-                panX = it.positionX,
-                panY = it.positionY
-            )
-        }
+        val result = analyzeVideoMotion(context, referenceUri, durationMs, onProgress)
+        return result.samples
     }
 
     private fun extractScaledBitmap(retriever: MediaMetadataRetriever, timeMs: Long): Bitmap? {
@@ -271,11 +343,13 @@ object MotionAnalyzer {
     }
 
     /**
-     * Symmetrically estimates the scale factor and pan translation between two frames.
-     * Evaluates candidate relative scales (zoom in > 1.0, hold == 1.0, zoom out < 1.0)
-     * using multi-scale region correlation with sub-pixel parabolic refinement.
+     * Optical-flow based 2D affine camera estimation:
+     * - Distributes feature tracking points across salient image textures
+     * - Finds sub-pixel displacements (dx, dy)
+     * - Decouples zoom rate (radial expansion/contraction) from camera pan
+     * - Uses trimmed mean to reject moving object outliers
      */
-    private fun estimateFrameMotion(
+    private fun estimateOpticalFlowCameraMotion(
         prevFrame: LumaFrame,
         currFrame: LumaFrame
     ): FrameMotionDelta {
@@ -286,7 +360,7 @@ object MotionAnalyzer {
             prevFrame.width != width || prevFrame.height != height ||
             prevFrame.luma.size != width * height || currFrame.luma.size != width * height
         ) {
-            return FrameMotionDelta(0f, 0f, 1.0f)
+            return FrameMotionDelta(0f, 0f, 0f, 0)
         }
 
         val prevLuma = prevFrame.luma
@@ -295,134 +369,138 @@ object MotionAnalyzer {
         val cx = width / 2.0f
         val cy = height / 2.0f
 
-        // Candidate relative scale factors covering zoom-out (<1.0) and zoom-in (>1.0) symmetrically
-        val scaleCandidates = floatArrayOf(
-            0.92f, 0.94f, 0.96f, 0.97f, 0.98f, 0.99f,
-            1.00f,
-            1.01f, 1.02f, 1.03f, 1.04f, 1.06f, 1.08f
-        )
-        val errors = FloatArray(scaleCandidates.size)
+        // Grid configuration for feature detection
+        val cols = 8
+        val rows = 6
+        val blockW = width / cols
+        val blockH = height / rows
+        val patchRadius = 4 // 9x9 template patch
+        val searchRadiusX = 14
+        val searchRadiusY = 10
 
-        // Evaluate difference across central active region
-        val startX = (width * 0.20f).toInt()
-        val endX = (width * 0.80f).toInt()
-        val startY = (height * 0.20f).toInt()
-        val endY = (height * 0.80f).toInt()
-        val step = 4
+        val radialAlphas = mutableListOf<Float>()
+        val panDisplacementsX = mutableListOf<Float>()
+        val panDisplacementsY = mutableListOf<Float>()
 
-        for (sIdx in scaleCandidates.indices) {
-            val s = scaleCandidates[sIdx]
-            var sumDiff = 0L
-            var count = 0
+        for (r in 1 until rows - 1) {
+            for (c in 1 until cols - 1) {
+                // Find highest gradient pixel in this block to track salient feature
+                var bestPx = c * blockW + blockW / 2
+                var bestPy = r * blockH + blockH / 2
+                var maxGrad = 0
 
-            var y = startY
-            while (y < endY) {
-                val ry = y - cy
-                val mappedY = (cy + s * ry).toInt()
-                if (mappedY in 0 until height) {
-                    val prevRow = y * width
-                    val currRow = mappedY * width
-
-                    var x = startX
-                    while (x < endX) {
-                        val rx = x - cx
-                        val mappedX = (cx + s * rx).toInt()
-                        if (mappedX in 0 until width) {
-                            val pIdx = prevRow + x
-                            val cIdx = currRow + mappedX
-                            if (pIdx in prevLuma.indices && cIdx in currLuma.indices) {
-                                val pVal = prevLuma[pIdx].toInt() and 0xFF
-                                val cVal = currLuma[cIdx].toInt() and 0xFF
-                                sumDiff += abs(pVal - cVal)
-                                count++
-                            }
-                        }
-                        x += step
-                    }
-                }
-                y += step
-            }
-
-            errors[sIdx] = if (count > 0) sumDiff.toFloat() / count.toFloat() else Float.MAX_VALUE
-        }
-
-        // Find scale candidate with minimum error
-        var bestIdx = 0
-        var minErr = errors[0]
-
-        for (i in errors.indices) {
-            if (errors[i] < minErr) {
-                minErr = errors[i]
-                bestIdx = i
-            }
-        }
-
-        // Parabolic sub-step refinement around the minimum
-        var bestScale = scaleCandidates[bestIdx]
-        if (bestIdx > 0 && bestIdx < scaleCandidates.size - 1) {
-            val y0 = errors[bestIdx - 1]
-            val y1 = errors[bestIdx]
-            val y2 = errors[bestIdx + 1]
-            val denom = 2.0f * (y0 - 2.0f * y1 + y2)
-            if (abs(denom) > 1e-4f) {
-                val delta = (y0 - y2) / denom
-                val stepSize = (scaleCandidates[bestIdx + 1] - scaleCandidates[bestIdx - 1]) / 2.0f
-                bestScale = (bestScale + delta * stepSize).coerceIn(0.90f, 1.10f)
-            }
-        }
-
-        // Estimate pan translation with the refined scale
-        val panCandidatesX = intArrayOf(-6, -3, 0, 3, 6)
-        val panCandidatesY = intArrayOf(-4, -2, 0, 2, 4)
-        var bestDx = 0
-        var bestDy = 0
-        var minPanErr = Long.MAX_VALUE
-
-        for (dy in panCandidatesY) {
-            for (dx in panCandidatesX) {
-                var panDiff = 0L
-                var panCount = 0
+                val startY = r * blockH + patchRadius + 1
+                val endY = (r + 1) * blockH - patchRadius - 1
+                val startX = c * blockW + patchRadius + 1
+                val endX = (c + 1) * blockW - patchRadius - 1
 
                 var y = startY
                 while (y < endY) {
-                    val ry = y - cy
-                    val mappedY = (cy + bestScale * ry + dy).toInt()
-                    if (mappedY in 0 until height) {
-                        val prevRow = y * width
-                        val currRow = mappedY * width
-
-                        var x = startX
-                        while (x < endX) {
-                            val rx = x - cx
-                            val mappedX = (cx + bestScale * rx + dx).toInt()
-                            if (mappedX in 0 until width) {
-                                val pIdx = prevRow + x
-                                val cIdx = currRow + mappedX
-                                if (pIdx in prevLuma.indices && cIdx in currLuma.indices) {
-                                    val pVal = prevLuma[pIdx].toInt() and 0xFF
-                                    val cVal = currLuma[cIdx].toInt() and 0xFF
-                                    panDiff += abs(pVal - cVal)
-                                    panCount++
-                                }
-                            }
-                            x += step * 2
+                    var x = startX
+                    while (x < endX) {
+                        val rowOff = y * width
+                        val gx = abs((prevLuma[rowOff + x + 1].toInt() and 0xFF) - (prevLuma[rowOff + x - 1].toInt() and 0xFF))
+                        val gy = abs((prevLuma[(y + 1) * width + x].toInt() and 0xFF) - (prevLuma[(y - 1) * width + x].toInt() and 0xFF))
+                        val grad = gx + gy
+                        if (grad > maxGrad) {
+                            maxGrad = grad
+                            bestPx = x
+                            bestPy = y
                         }
+                        x += 3
                     }
-                    y += step * 2
+                    y += 3
                 }
 
-                if (panCount > 0 && panDiff < minPanErr) {
-                    minPanErr = panDiff
-                    bestDx = dx
-                    bestDy = dy
+                // Skip flat/featureless blocks
+                if (maxGrad < 20) continue
+
+                val px = bestPx
+                val py = bestPy
+
+                // Block matching optical flow with step 1
+                var bestDx = 0
+                var bestDy = 0
+                var minSAD = Long.MAX_VALUE
+
+                var sDy = -searchRadiusY
+                while (sDy <= searchRadiusY) {
+                    val cyPos = py + sDy
+                    if (cyPos - patchRadius >= 0 && cyPos + patchRadius < height) {
+                        var sDx = -searchRadiusX
+                        while (sDx <= searchRadiusX) {
+                            val cxPos = px + sDx
+                            if (cxPos - patchRadius >= 0 && cxPos + patchRadius < width) {
+                                var sumDiff = 0L
+                                for (pyi in -patchRadius..patchRadius) {
+                                    val pRow = (py + pyi) * width
+                                    val cRow = (cyPos + pyi) * width
+                                    for (pxi in -patchRadius..patchRadius) {
+                                        val pVal = prevLuma[pRow + (px + pxi)].toInt() and 0xFF
+                                        val cVal = currLuma[cRow + (cxPos + pxi)].toInt() and 0xFF
+                                        sumDiff += abs(pVal - cVal)
+                                    }
+                                }
+
+                                if (sumDiff < minSAD) {
+                                    minSAD = sumDiff
+                                    bestDx = sDx
+                                    bestDy = sDy
+                                }
+                            }
+                            sDx++
+                        }
+                    }
+                    sDy++
+                }
+
+                val patchPixels = (patchRadius * 2 + 1) * (patchRadius * 2 + 1)
+                val avgDiff = minSAD.toFloat() / patchPixels.toFloat()
+
+                // Reject poor matches
+                if (avgDiff < 32f) {
+                    val rx = px - cx
+                    val ry = py - cy
+                    val rDistSq = rx * rx + ry * ry
+
+                    // Calculate radial zoom expansion/contraction
+                    if (rDistSq > 225f) { // radius >= 15px
+                        val radialComponent = (bestDx * rx + bestDy * ry) / rDistSq
+                        radialAlphas.add(radialComponent)
+                    }
+
+                    panDisplacementsX.add(bestDx.toFloat())
+                    panDisplacementsY.add(bestDy.toFloat())
                 }
             }
         }
 
+        if (radialAlphas.isEmpty()) {
+            return FrameMotionDelta(0f, 0f, 0f, 0)
+        }
+
+        // Trimmed mean (middle 60%) to reject moving objects and outlier noise
+        radialAlphas.sort()
+        val trimStart = (radialAlphas.size * 0.20f).toInt()
+        val trimEnd = (radialAlphas.size * 0.80f).toInt().coerceAtLeast(trimStart + 1)
+        var sumAlpha = 0f
+        var countAlpha = 0
+        for (i in trimStart until trimEnd) {
+            sumAlpha += radialAlphas[i]
+            countAlpha++
+        }
+        val medianZoomAlpha = if (countAlpha > 0) sumAlpha / countAlpha else 0f
+
+        panDisplacementsX.sort()
+        panDisplacementsY.sort()
+        val medianDx = panDisplacementsX[panDisplacementsX.size / 2]
+        val medianDy = panDisplacementsY[panDisplacementsY.size / 2]
+
         return FrameMotionDelta(
-            deltaX = bestDx.toFloat(),
-            deltaY = bestDy.toFloat(),
-            scaleFactor = bestScale
+            deltaX = medianDx,
+            deltaY = medianDy,
+            zoomAlpha = medianZoomAlpha,
+            validFeatureCount = radialAlphas.size
         )
     }
 

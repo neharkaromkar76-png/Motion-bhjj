@@ -6,6 +6,96 @@ import com.example.model.MotionTransform
 
 object MotionInterpolator {
 
+    /**
+     * Interpolates continuous camera transform from dense motion samples.
+     * Uses binary search and cubic Hermite smoothstep for frame-accurate, fluid motion.
+     */
+    fun interpolateFromSamples(samples: List<RawMotionSample>, queryTimestampMs: Long): MotionTransform {
+        if (samples.isEmpty()) {
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = 1.0f,
+                positionX = 0.5f,
+                positionY = 0.5f,
+                rotationDeg = 0f
+            )
+        }
+
+        if (samples.size == 1) {
+            val single = samples[0]
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = single.scale,
+                positionX = single.panX,
+                positionY = single.panY,
+                rotationDeg = 0f
+            )
+        }
+
+        val first = samples.first()
+        if (queryTimestampMs <= first.timestampMs) {
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = first.scale,
+                positionX = first.panX,
+                positionY = first.panY,
+                rotationDeg = 0f
+            )
+        }
+
+        val last = samples.last()
+        if (queryTimestampMs >= last.timestampMs) {
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = last.scale,
+                positionX = last.panX,
+                positionY = last.panY,
+                rotationDeg = 0f
+            )
+        }
+
+        // Fast binary search to find interval [low, low + 1]
+        var low = 0
+        var high = samples.size - 1
+        var matchIdx = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (samples[mid].timestampMs <= queryTimestampMs) {
+                matchIdx = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+
+        val idx0 = matchIdx.coerceIn(0, samples.size - 2)
+        val idx1 = idx0 + 1
+
+        val s0 = samples[idx0]
+        val s1 = samples[idx1]
+
+        val span = (s1.timestampMs - s0.timestampMs).coerceAtLeast(1L).toFloat()
+        val rawAlpha = ((queryTimestampMs - s0.timestampMs).toFloat() / span).coerceIn(0f, 1f)
+
+        // Smooth cubic Hermite S-curve
+        val alpha = rawAlpha * rawAlpha * (3f - 2f * rawAlpha)
+
+        val scale = lerp(s0.scale, s1.scale, alpha)
+        val posX = lerp(s0.panX, s1.panX, alpha)
+        val posY = lerp(s0.panY, s1.panY, alpha)
+
+        return MotionTransform(
+            timestampMs = queryTimestampMs,
+            scale = scale,
+            positionX = posX,
+            positionY = posY,
+            rotationDeg = 0f
+        )
+    }
+
+    /**
+     * Interpolates between keyframes according to their assigned interpolation type.
+     */
     fun interpolate(keyframes: List<MotionKeyframe>, queryTimestampMs: Long): MotionTransform {
         if (keyframes.isEmpty()) {
             return MotionTransform(

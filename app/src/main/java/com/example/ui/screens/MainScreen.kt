@@ -225,7 +225,8 @@ fun MainScreen(
                         onSeek = { viewModel.updatePlaybackPosition(it) },
                         onAddKeyframeAtCurrentTime = {
                             viewModel.addKeyframeAtTime(uiState.currentPositionMs)
-                        }
+                        },
+                        samples = uiState.rawSamples
                     )
                 }
 

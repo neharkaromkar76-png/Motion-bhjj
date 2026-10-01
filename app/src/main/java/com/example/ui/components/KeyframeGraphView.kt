@@ -54,6 +54,7 @@ import com.example.utils.TimeFormatter
 import com.example.video.MotionDirection
 import com.example.video.MotionInterpolator
 import com.example.video.MotionTimeline
+import com.example.video.RawMotionSample
 
 @Composable
 fun KeyframeGraphView(
@@ -64,18 +65,27 @@ fun KeyframeGraphView(
     onKeyframeSelected: (MotionKeyframe) -> Unit,
     onSeek: (Long) -> Unit,
     onAddKeyframeAtCurrentTime: () -> Unit,
+    samples: List<RawMotionSample> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     val safeDuration = durationMs.coerceAtLeast(1000L)
-    val timeline = remember(keyframes, safeDuration) {
-        MotionTimeline(safeDuration, keyframes)
+    val timeline = remember(keyframes, samples, safeDuration) {
+        MotionTimeline(safeDuration, keyframes, samples)
     }
 
-    val maxScale = remember(keyframes) {
-        keyframes.maxOfOrNull { it.scale }?.coerceAtLeast(1.4f) ?: 2.0f
+    val maxScale = remember(keyframes, samples) {
+        if (samples.isNotEmpty()) {
+            samples.maxOfOrNull { it.scale }?.coerceAtLeast(1.4f) ?: 2.0f
+        } else {
+            keyframes.maxOfOrNull { it.scale }?.coerceAtLeast(1.4f) ?: 2.0f
+        }
     }
-    val minScale = remember(keyframes) {
-        keyframes.minOfOrNull { it.scale }?.coerceAtMost(1.0f) ?: 1.0f
+    val minScale = remember(keyframes, samples) {
+        if (samples.isNotEmpty()) {
+            samples.minOfOrNull { it.scale }?.coerceAtMost(1.0f) ?: 1.0f
+        } else {
+            keyframes.minOfOrNull { it.scale }?.coerceAtMost(1.0f) ?: 1.0f
+        }
     }
 
     Column(
@@ -232,7 +242,7 @@ fun KeyframeGraphView(
                     for (step in 0..steps) {
                         val tFrac = step / steps.toFloat()
                         val sampleTime = (tFrac * safeDuration).toLong()
-                        val motion = MotionInterpolator.interpolate(keyframes, sampleTime)
+                        val motion = timeline.getTransformForOriginalTime(sampleTime, safeDuration, com.example.model.TimelineMappingMode.EXACT_TIME)
 
                         val x = tFrac * w
                         val normScale = ((motion.scale - minScale) / scaleSpan).coerceIn(0f, 1.2f)
