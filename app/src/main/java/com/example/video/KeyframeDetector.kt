@@ -45,9 +45,14 @@ object KeyframeDetector {
 
         // 1. Smooth raw samples with a 3-tap Gaussian moving window to suppress high-frequency noise
         val smoothed = smoothSamples(rawSamples)
+        if (smoothed.isEmpty()) {
+            return listOf(
+                MotionKeyframe(timestampMs = 0L, scale = 1.0f, positionX = 0.5f, positionY = 0.5f),
+                MotionKeyframe(timestampMs = referenceDurationMs, scale = 1.0f, positionX = 0.5f, positionY = 0.5f)
+            )
+        }
 
         // 2. Identify key inflection points:
-        // We detect points where scale or position trajectory changes direction or acceleration
         val keyframeCandidates = mutableListOf<MotionKeyframe>()
 
         // Always include initial frame at 0ms
@@ -65,6 +70,8 @@ object KeyframeDetector {
         // Find extrema and slope changes
         if (smoothed.size > 2) {
             for (i in 1 until smoothed.size - 1) {
+                if (i - 1 !in smoothed.indices || i !in smoothed.indices || i + 1 !in smoothed.indices) continue
+
                 val prev = smoothed[i - 1]
                 val curr = smoothed[i]
                 val next = smoothed[i + 1]
@@ -82,7 +89,7 @@ object KeyframeDetector {
                 val isScaleExtremum = (scaleSlope1 * scaleSlope2 < 0f) && (abs(scaleSlope1) > 0.015f || abs(scaleSlope2) > 0.015f)
 
                 // Large scale delta from last added keyframe
-                val lastKeyframe = keyframeCandidates.last()
+                val lastKeyframe = keyframeCandidates.lastOrNull() ?: keyframeCandidates[0]
                 val deltaScaleFromLast = abs(curr.scale - lastKeyframe.scale)
                 val deltaPanFromLast = abs(curr.panX - lastKeyframe.positionX) + abs(curr.panY - lastKeyframe.positionY)
                 val deltaTimeFromLast = curr.timestampMs - lastKeyframe.timestampMs
@@ -112,7 +119,9 @@ object KeyframeDetector {
         // Always include terminal frame at referenceDurationMs
         val lastSample = smoothed.last()
         val finalTimestamp = referenceDurationMs.coerceAtLeast(lastSample.timestampMs)
-        if (keyframeCandidates.last().timestampMs < finalTimestamp - 300L) {
+        val lastCand = keyframeCandidates.lastOrNull()
+
+        if (lastCand == null || lastCand.timestampMs < finalTimestamp - 300L) {
             keyframeCandidates.add(
                 MotionKeyframe(
                     timestampMs = finalTimestamp,
@@ -122,7 +131,7 @@ object KeyframeDetector {
                     interpolation = InterpolationType.EASE_IN_OUT
                 )
             )
-        } else {
+        } else if (keyframeCandidates.isNotEmpty()) {
             val prevLast = keyframeCandidates.removeAt(keyframeCandidates.size - 1)
             keyframeCandidates.add(
                 prevLast.copy(timestampMs = finalTimestamp)
@@ -131,10 +140,11 @@ object KeyframeDetector {
 
         // If very few keyframes were detected, add midpoint anchor
         if (keyframeCandidates.size <= 2 && smoothed.size >= 4) {
-            val midIdx = smoothed.size / 2
+            val midIdx = (smoothed.size / 2).coerceIn(0, smoothed.size - 1)
             val midSample = smoothed[midIdx]
+            val insertIdx = 1.coerceIn(0, keyframeCandidates.size)
             keyframeCandidates.add(
-                1,
+                insertIdx,
                 MotionKeyframe(
                     timestampMs = midSample.timestampMs,
                     scale = roundToDecimals(midSample.scale, 2),
@@ -145,35 +155,37 @@ object KeyframeDetector {
             )
         }
 
-        return keyframeCandidates.sortedBy { it.timestampMs }
+        return keyframeCandidates.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
     }
 
     private fun smoothSamples(samples: List<RawMotionSample>): List<RawMotionSample> {
         if (samples.size < 3) return samples
 
         val result = mutableListOf<RawMotionSample>()
-        result.add(samples.first())
+        samples.firstOrNull()?.let { result.add(it) }
 
         for (i in 1 until samples.size - 1) {
-            val p = samples[i - 1]
-            val c = samples[i]
-            val n = samples[i + 1]
+            if (i - 1 in samples.indices && i in samples.indices && i + 1 in samples.indices) {
+                val p = samples[i - 1]
+                val c = samples[i]
+                val n = samples[i + 1]
 
-            val smoothedScale = p.scale * 0.25f + c.scale * 0.50f + n.scale * 0.25f
-            val smoothedPanX = p.panX * 0.25f + c.panX * 0.50f + n.panX * 0.25f
-            val smoothedPanY = p.panY * 0.25f + c.panY * 0.50f + n.panY * 0.25f
+                val smoothedScale = p.scale * 0.25f + c.scale * 0.50f + n.scale * 0.25f
+                val smoothedPanX = p.panX * 0.25f + c.panX * 0.50f + n.panX * 0.25f
+                val smoothedPanY = p.panY * 0.25f + c.panY * 0.50f + n.panY * 0.25f
 
-            result.add(
-                RawMotionSample(
-                    timestampMs = c.timestampMs,
-                    scale = smoothedScale,
-                    panX = smoothedPanX,
-                    panY = smoothedPanY
+                result.add(
+                    RawMotionSample(
+                        timestampMs = c.timestampMs,
+                        scale = smoothedScale,
+                        panX = smoothedPanX,
+                        panY = smoothedPanY
+                    )
                 )
-            )
+            }
         }
 
-        result.add(samples.last())
+        samples.lastOrNull()?.let { result.add(it) }
         return result
     }
 

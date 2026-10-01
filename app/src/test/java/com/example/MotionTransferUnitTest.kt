@@ -129,4 +129,64 @@ class MotionTransferUnitTest {
         assertEquals(3500L, result.last().timestampMs)
         assertTrue("Timeline should contain keyframe with millisecond timestamp", result.any { it.timestampMs in 1000L..1500L })
     }
+
+    @Test
+    fun testMotionTimeline_exactTimeMapping_longDuration48s() {
+        val refDuration = 48577L // 00:48.577
+        val origDuration = 48879L // 00:48.879
+
+        val keyframes = listOf(
+            MotionKeyframe(timestampMs = 0L, scale = 1.0f, positionX = 0.5f, positionY = 0.5f),
+            MotionKeyframe(timestampMs = 12045L, scale = 1.5f, positionX = 0.6f, positionY = 0.5f),
+            MotionKeyframe(timestampMs = 24000L, scale = 1.8f, positionX = 0.5f, positionY = 0.5f),
+            MotionKeyframe(timestampMs = 48577L, scale = 1.0f, positionX = 0.5f, positionY = 0.5f)
+        )
+
+        val timeline = MotionTimeline(
+            referenceDurationMs = refDuration,
+            keyframes = keyframes
+        )
+
+        // Query at index/time 12045ms (from user error)
+        val transformAt12s = timeline.getTransformForOriginalTime(
+            originalTimeMs = 12045L,
+            originalDurationMs = origDuration,
+            mappingMode = TimelineMappingMode.EXACT_TIME
+        )
+        assertEquals(1.5f, transformAt12s.scale, 0.01f)
+        assertEquals(12045L, transformAt12s.timestampMs)
+
+        // Query beyond reference duration
+        val transformAtEnd = timeline.getTransformForOriginalTime(
+            originalTimeMs = 48879L,
+            originalDurationMs = origDuration,
+            mappingMode = TimelineMappingMode.EXACT_TIME
+        )
+        assertEquals(1.0f, transformAtEnd.scale, 0.01f)
+        assertEquals(48879L, transformAtEnd.timestampMs)
+    }
+
+    @Test
+    fun testMotionInterpolator_boundsSafety() {
+        // Empty list
+        val emptyTransform = MotionInterpolator.interpolate(emptyList(), 12045L)
+        assertEquals(1.0f, emptyTransform.scale, 0.01f)
+
+        // Single keyframe
+        val single = listOf(MotionKeyframe(timestampMs = 5000L, scale = 2.0f, positionX = 0.7f, positionY = 0.3f))
+        val singleBefore = MotionInterpolator.interpolate(single, 0L)
+        assertEquals(2.0f, singleBefore.scale, 0.01f)
+        val singleAfter = MotionInterpolator.interpolate(single, 10000L)
+        assertEquals(2.0f, singleAfter.scale, 0.01f)
+
+        // Query before start and after end
+        val keyframes = listOf(
+            MotionKeyframe(timestampMs = 1000L, scale = 1.2f),
+            MotionKeyframe(timestampMs = 2000L, scale = 1.4f)
+        )
+        val before = MotionInterpolator.interpolate(keyframes, -500L)
+        assertEquals(1.2f, before.scale, 0.01f)
+        val after = MotionInterpolator.interpolate(keyframes, 99999L)
+        assertEquals(1.4f, after.scale, 0.01f)
+    }
 }

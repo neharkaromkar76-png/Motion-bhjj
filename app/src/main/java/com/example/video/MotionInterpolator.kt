@@ -18,9 +18,29 @@ object MotionInterpolator {
         }
 
         val sorted = keyframes.sortedBy { it.timestampMs }
+        if (sorted.isEmpty()) {
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = 1.0f,
+                positionX = 0.5f,
+                positionY = 0.5f,
+                rotationDeg = 0f
+            )
+        }
 
-        if (queryTimestampMs <= sorted.first().timestampMs) {
-            val first = sorted.first()
+        if (sorted.size == 1) {
+            val single = sorted[0]
+            return MotionTransform(
+                timestampMs = queryTimestampMs,
+                scale = single.scale,
+                positionX = single.positionX,
+                positionY = single.positionY,
+                rotationDeg = single.rotationDeg
+            )
+        }
+
+        val first = sorted.first()
+        if (queryTimestampMs <= first.timestampMs) {
             return MotionTransform(
                 timestampMs = queryTimestampMs,
                 scale = first.scale,
@@ -30,8 +50,8 @@ object MotionInterpolator {
             )
         }
 
-        if (queryTimestampMs >= sorted.last().timestampMs) {
-            val last = sorted.last()
+        val last = sorted.last()
+        if (queryTimestampMs >= last.timestampMs) {
             return MotionTransform(
                 timestampMs = queryTimestampMs,
                 scale = last.scale,
@@ -41,13 +61,15 @@ object MotionInterpolator {
             )
         }
 
-        // Binary search or linear scan for segment
+        // Scan for containing segment
         var k0 = sorted[0]
-        var k1 = sorted[1]
+        var k1 = sorted.getOrElse(1) { sorted[0] }
         for (i in 0 until sorted.size - 1) {
-            if (queryTimestampMs >= sorted[i].timestampMs && queryTimestampMs <= sorted[i + 1].timestampMs) {
-                k0 = sorted[i]
-                k1 = sorted[i + 1]
+            val cur = sorted[i]
+            val next = sorted[i + 1]
+            if (queryTimestampMs >= cur.timestampMs && queryTimestampMs <= next.timestampMs) {
+                k0 = cur
+                k1 = next
                 break
             }
         }
