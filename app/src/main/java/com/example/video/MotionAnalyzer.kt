@@ -24,10 +24,6 @@ object MotionAnalyzer {
 
     private const val ANALYSIS_WIDTH = 256
     private const val ANALYSIS_HEIGHT = 144
-    private const val PATCH_SIZE = 14
-    private const val SEARCH_RADIUS = 16
-    private const val GRID_COLS = 6
-    private const val GRID_ROWS = 4
 
     private data class LumaFrame(
         val luma: ByteArray,
@@ -35,10 +31,16 @@ object MotionAnalyzer {
         val height: Int
     )
 
+    private data class FrameMotionDelta(
+        val deltaX: Float,
+        val deltaY: Float,
+        val scaleFactor: Float
+    )
+
     /**
-     * Uses MediaExtractor to step through reference video frames across the entire timeline
-     * and stores extracted motion data directly into a list of MotionKeyframe objects using
-     * timestamps in milliseconds.
+     * Steps through the reference video across the entire timeline (0.000s to end),
+     * extracting dense motion data and producing accurate keyframes that capture
+     * both zoom-in and zoom-out camera transforms.
      */
     suspend fun extractMotionKeyframesWithMediaExtractor(
         context: Context,
@@ -54,10 +56,11 @@ object MotionAnalyzer {
             retriever.setDataSource(context, referenceUri)
         } catch (e: Exception) {
             extractor.release()
+            try { retriever.release() } catch (_: Exception) {}
             throw IllegalArgumentException("Reference video could not be read: ${e.localizedMessage}")
         }
 
-        val extractedKeyframes = mutableListOf<MotionKeyframe>()
+        val rawSamples = mutableListOf<RawMotionSample>()
 
         try {
             var videoTrackIndex = -1
@@ -77,12 +80,12 @@ object MotionAnalyzer {
             extractor.selectTrack(videoTrackIndex)
 
             val safeDurationMs = durationMs.coerceAtLeast(500L)
-            // Minimum sample step to maintain responsive speed and prevent redundant frame calculations
+            // Dense sampling interval for high-fidelity zoom curve reconstruction (100ms - 150ms)
             val sampleStepThresholdMs = when {
-                safeDurationMs <= 3000L -> 100L
-                safeDurationMs <= 10000L -> 150L
-                safeDurationMs <= 30000L -> 250L
-                else -> (safeDurationMs / 100L).coerceIn(300L, 600L)
+                safeDurationMs <= 5000L -> 80L
+                safeDurationMs <= 15000L -> 100L
+                safeDurationMs <= 35000L -> 125L
+                else -> 150L
             }
 
             var previousFrame: LumaFrame? = null
@@ -90,35 +93,31 @@ object MotionAnalyzer {
             var currentPanX = 0.5f
             var currentPanY = 0.5f
 
-            // Always add initial anchor at 0ms
-            extractedKeyframes.add(
-                MotionKeyframe(
+            // Add initial sample at 0ms
+            rawSamples.add(
+                RawMotionSample(
                     timestampMs = 0L,
                     scale = 1.0f,
-                    positionX = 0.5f,
-                    positionY = 0.5f,
-                    rotationDeg = 0f,
-                    interpolation = InterpolationType.EASE_IN_OUT
+                    panX = 0.5f,
+                    panY = 0.5f
                 )
             )
 
             var lastSampledMs = 0L
 
-            // Step through reference video frames using MediaExtractor
+            // Step through reference video frames using MediaExtractor timestamps
             while (true) {
                 ensureActive()
                 val sampleTimeUs = extractor.sampleTime
                 if (sampleTimeUs < 0) break
 
-                // Frame timestamp in milliseconds
                 val frameTimeMs = (sampleTimeUs / 1000L).coerceIn(0L, safeDurationMs)
 
-                // Check if frame satisfies sample interval step
                 if (frameTimeMs == 0L || abs(frameTimeMs - lastSampledMs) >= sampleStepThresholdMs) {
                     val progress = (frameTimeMs.toFloat() / safeDurationMs.toFloat()).coerceIn(0f, 1f)
                     val formattedCurrent = String.format(java.util.Locale.US, "%.2fs", frameTimeMs / 1000f)
                     val formattedDuration = String.format(java.util.Locale.US, "%.2fs", safeDurationMs / 1000f)
-                    val statusText = "Extracting motion at $formattedCurrent / $formattedDuration (${(progress * 100).toInt()}%)"
+                    val statusText = "Analyzing reference motion at $formattedCurrent / $formattedDuration (${(progress * 100).toInt()}%)"
                     onProgress(progress, statusText)
 
                     val frameBitmap = extractScaledBitmap(retriever, frameTimeMs)
@@ -127,29 +126,23 @@ object MotionAnalyzer {
                         frameBitmap.recycle()
 
                         if (previousFrame != null) {
-                            val frameDelta = estimateFrameMotion(
-                                previousFrame,
-                                currentFrame
-                            )
+                            val frameDelta = estimateFrameMotion(previousFrame, currentFrame)
 
-                            // Accumulate scale with dampening to avoid noise
-                            val stepScaleFactor = frameDelta.scaleFactor.coerceIn(0.92f, 1.08f)
-                            currentScale = (currentScale * stepScaleFactor).coerceIn(0.6f, 3.0f)
+                            // Apply frame scale change symmetrically for both zoom-in and zoom-out
+                            val stepFactor = frameDelta.scaleFactor.coerceIn(0.85f, 1.15f)
+                            currentScale = (currentScale * stepFactor).coerceIn(0.5f, 4.0f)
 
-                            // Accumulate pan coordinates (normalized 0.0 to 1.0)
                             val dNormX = if (currentFrame.width > 0) frameDelta.deltaX / currentFrame.width.toFloat() else 0f
                             val dNormY = if (currentFrame.height > 0) frameDelta.deltaY / currentFrame.height.toFloat() else 0f
-                            currentPanX = (currentPanX + dNormX * 0.8f).coerceIn(0.1f, 0.9f)
-                            currentPanY = (currentPanY + dNormY * 0.8f).coerceIn(0.1f, 0.9f)
+                            currentPanX = (currentPanX + dNormX * 0.7f).coerceIn(0.1f, 0.9f)
+                            currentPanY = (currentPanY + dNormY * 0.7f).coerceIn(0.1f, 0.9f)
 
-                            extractedKeyframes.add(
-                                MotionKeyframe(
+                            rawSamples.add(
+                                RawMotionSample(
                                     timestampMs = frameTimeMs,
-                                    scale = roundToDecimals(currentScale, 2),
-                                    positionX = roundToDecimals(currentPanX, 3),
-                                    positionY = roundToDecimals(currentPanY, 3),
-                                    rotationDeg = 0f,
-                                    interpolation = InterpolationType.EASE_IN_OUT
+                                    scale = currentScale,
+                                    panX = currentPanX,
+                                    panY = currentPanY
                                 )
                             )
                         }
@@ -159,49 +152,62 @@ object MotionAnalyzer {
                     }
                 }
 
-                // Advance MediaExtractor to next reference frame
                 if (!extractor.advance()) break
             }
 
-            // Ensure the exact end timestamp of reference video is present
-            if (extractedKeyframes.isEmpty()) {
-                extractedKeyframes.add(
-                    MotionKeyframe(
-                        timestampMs = 0L,
-                        scale = 1.0f,
-                        positionX = 0.5f,
-                        positionY = 0.5f,
-                        rotationDeg = 0f,
-                        interpolation = InterpolationType.EASE_IN_OUT
-                    )
-                )
-            }
-
-            val lastExisting = extractedKeyframes.last()
-            if (lastExisting.timestampMs < safeDurationMs) {
-                extractedKeyframes.add(
-                    MotionKeyframe(
+            // Ensure terminal timestamp is present
+            if (rawSamples.isNotEmpty() && rawSamples.last().timestampMs < safeDurationMs) {
+                val last = rawSamples.last()
+                rawSamples.add(
+                    RawMotionSample(
                         timestampMs = safeDurationMs,
-                        scale = roundToDecimals(lastExisting.scale, 2),
-                        positionX = roundToDecimals(lastExisting.positionX, 3),
-                        positionY = roundToDecimals(lastExisting.positionY, 3),
-                        rotationDeg = 0f,
-                        interpolation = InterpolationType.EASE_IN_OUT
+                        scale = last.scale,
+                        panX = last.panX,
+                        panY = last.panY
                     )
                 )
             }
 
-            onProgress(1.0f, "Reference motion extraction complete")
-            extractedKeyframes.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
+            // Sort and deduplicate raw samples
+            val sortedSamples = rawSamples.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
+
+            // Normalize curve to prevent black borders while strictly preserving relative rises and falls
+            val minScale = sortedSamples.minOfOrNull { it.scale } ?: 1.0f
+            val normalizedSamples = if (minScale < 1.0f && minScale > 0.1f) {
+                val multiplier = 1.0f / minScale
+                sortedSamples.map { sample ->
+                    sample.copy(
+                        scale = roundToDecimals(sample.scale * multiplier, 3),
+                        panX = roundToDecimals(sample.panX, 3),
+                        panY = roundToDecimals(sample.panY, 3)
+                    )
+                }
+            } else {
+                sortedSamples.map { sample ->
+                    sample.copy(
+                        scale = roundToDecimals(sample.scale, 3),
+                        panX = roundToDecimals(sample.panX, 3),
+                        panY = roundToDecimals(sample.panY, 3)
+                    )
+                }
+            }
+
+            onProgress(0.95f, "Reconstructing motion turning points...")
+
+            // Reconstruct keyframes capturing all zoom-in and zoom-out inflection points
+            val reconstructedKeyframes = KeyframeDetector.reconstructKeyframes(
+                rawSamples = normalizedSamples,
+                referenceDurationMs = safeDurationMs
+            )
+
+            onProgress(1.0f, "Reference motion analysis complete (${reconstructedKeyframes.size} keyframes)")
+            reconstructedKeyframes
         } finally {
             extractor.release()
             try { retriever.release() } catch (_: Exception) {}
         }
     }
 
-    /**
-     * Backward-compatible method returning RawMotionSample list.
-     */
     suspend fun analyzeReferenceVideo(
         context: Context,
         referenceUri: Uri,
@@ -219,12 +225,6 @@ object MotionAnalyzer {
         }
     }
 
-    /**
-     * Safely extracts a normalized bitmap strictly guaranteed to be ANALYSIS_WIDTH x ANALYSIS_HEIGHT.
-     * Note: MediaMetadataRetriever.getScaledFrameAtTime scales while preserving original aspect ratio
-     * (e.g. 720x1280 9:16 portrait video yields 81x144, 11664 bytes instead of 256x144).
-     * We guarantee exact dimensions by re-scaling if the decoder preserved aspect ratio.
-     */
     private fun extractScaledBitmap(retriever: MediaMetadataRetriever, timeMs: Long): Bitmap? {
         val timeUs = (timeMs * 1000L).coerceAtLeast(0L)
         return try {
@@ -270,12 +270,11 @@ object MotionAnalyzer {
         return LumaFrame(luma, width, height)
     }
 
-    private data class FrameMotionDelta(
-        val deltaX: Float,
-        val deltaY: Float,
-        val scaleFactor: Float
-    )
-
+    /**
+     * Symmetrically estimates the scale factor and pan translation between two frames.
+     * Evaluates candidate relative scales (zoom in > 1.0, hold == 1.0, zoom out < 1.0)
+     * using multi-scale region correlation with sub-pixel parabolic refinement.
+     */
     private fun estimateFrameMotion(
         prevFrame: LumaFrame,
         currFrame: LumaFrame
@@ -283,7 +282,6 @@ object MotionAnalyzer {
         val width = currFrame.width
         val height = currFrame.height
 
-        // Strict dimension and size match check
         if (width <= 0 || height <= 0 ||
             prevFrame.width != width || prevFrame.height != height ||
             prevFrame.luma.size != width * height || currFrame.luma.size != width * height
@@ -294,127 +292,137 @@ object MotionAnalyzer {
         val prevLuma = prevFrame.luma
         val currLuma = currFrame.luma
 
-        val centerX = width / 2.0f
-        val centerY = height / 2.0f
+        val cx = width / 2.0f
+        val cy = height / 2.0f
 
-        val stepX = width / (GRID_COLS + 1)
-        val stepY = height / (GRID_ROWS + 1)
+        // Candidate relative scale factors covering zoom-out (<1.0) and zoom-in (>1.0) symmetrically
+        val scaleCandidates = floatArrayOf(
+            0.92f, 0.94f, 0.96f, 0.97f, 0.98f, 0.99f,
+            1.00f,
+            1.01f, 1.02f, 1.03f, 1.04f, 1.06f, 1.08f
+        )
+        val errors = FloatArray(scaleCandidates.size)
 
-        val displacementsX = mutableListOf<Float>()
-        val displacementsY = mutableListOf<Float>()
-        val radialNumerator = mutableListOf<Float>()
-        val radialDenominator = mutableListOf<Float>()
+        // Evaluate difference across central active region
+        val startX = (width * 0.20f).toInt()
+        val endX = (width * 0.80f).toInt()
+        val startY = (height * 0.20f).toInt()
+        val endY = (height * 0.80f).toInt()
+        val step = 4
 
-        val halfPatch = PATCH_SIZE / 2
+        for (sIdx in scaleCandidates.indices) {
+            val s = scaleCandidates[sIdx]
+            var sumDiff = 0L
+            var count = 0
 
-        for (row in 1..GRID_ROWS) {
-            for (col in 1..GRID_COLS) {
-                val px = col * stepX
-                val py = row * stepY
+            var y = startY
+            while (y < endY) {
+                val ry = y - cy
+                val mappedY = (cy + s * ry).toInt()
+                if (mappedY in 0 until height) {
+                    val prevRow = y * width
+                    val currRow = mappedY * width
 
-                // Ensure entire template patch is safely inside image bounds
-                if (px - halfPatch < 0 || px + halfPatch >= width ||
-                    py - halfPatch < 0 || py + halfPatch >= height
-                ) continue
-
-                var bestDx = 0
-                var bestDy = 0
-                var minDiff = Long.MAX_VALUE
-                var foundMatch = false
-
-                for (dy in -SEARCH_RADIUS..SEARCH_RADIUS step 2) {
-                    val cy = py + dy
-                    if (cy - halfPatch < 0 || cy + halfPatch >= height) continue
-
-                    for (dx in -SEARCH_RADIUS..SEARCH_RADIUS step 2) {
-                        val cx = px + dx
-                        if (cx - halfPatch < 0 || cx + halfPatch >= width) continue
-
-                        var diffSum = 0L
-                        var validPixels = 0
-
-                        for (pyi in -halfPatch..halfPatch step 2) {
-                            val prevY = py + pyi
-                            val currY = cy + pyi
-                            if (prevY !in 0 until height || currY !in 0 until height) continue
-
-                            val prevRowOff = prevY * width
-                            val currRowOff = currY * width
-
-                            for (pxi in -halfPatch..halfPatch step 2) {
-                                val prevX = px + pxi
-                                val currX = cx + pxi
-                                if (prevX !in 0 until width || currX !in 0 until width) continue
-
-                                val pIdx = prevRowOff + prevX
-                                val cIdx = currRowOff + currX
-
-                                // Absolute bounds validation
-                                if (pIdx in 0 until prevLuma.size && cIdx in 0 until currLuma.size) {
-                                    val pVal = prevLuma[pIdx].toInt() and 0xFF
-                                    val cVal = currLuma[cIdx].toInt() and 0xFF
-                                    diffSum += abs(pVal - cVal)
-                                    validPixels++
-                                }
+                    var x = startX
+                    while (x < endX) {
+                        val rx = x - cx
+                        val mappedX = (cx + s * rx).toInt()
+                        if (mappedX in 0 until width) {
+                            val pIdx = prevRow + x
+                            val cIdx = currRow + mappedX
+                            if (pIdx in prevLuma.indices && cIdx in currLuma.indices) {
+                                val pVal = prevLuma[pIdx].toInt() and 0xFF
+                                val cVal = currLuma[cIdx].toInt() and 0xFF
+                                sumDiff += abs(pVal - cVal)
+                                count++
                             }
                         }
-
-                        if (validPixels > 0 && diffSum < minDiff) {
-                            minDiff = diffSum
-                            bestDx = dx
-                            bestDy = dy
-                            foundMatch = true
-                        }
+                        x += step
                     }
                 }
+                y += step
+            }
 
-                if (foundMatch) {
-                    val avgDiff = minDiff.toFloat() / ((PATCH_SIZE / 2) * (PATCH_SIZE / 2)).coerceAtLeast(1)
-                    if (avgDiff < 45f) {
-                        displacementsX.add(bestDx.toFloat())
-                        displacementsY.add(bestDy.toFloat())
+            errors[sIdx] = if (count > 0) sumDiff.toFloat() / count.toFloat() else Float.MAX_VALUE
+        }
 
-                        val rx = px - centerX
-                        val ry = py - centerY
-                        val rDistSq = rx * rx + ry * ry
+        // Find scale candidate with minimum error
+        var bestIdx = 0
+        var minErr = errors[0]
 
-                        if (rDistSq > 100f) {
-                            val radialDisp = (bestDx * rx + bestDy * ry)
-                            radialNumerator.add(radialDisp)
-                            radialDenominator.add(rDistSq)
+        for (i in errors.indices) {
+            if (errors[i] < minErr) {
+                minErr = errors[i]
+                bestIdx = i
+            }
+        }
+
+        // Parabolic sub-step refinement around the minimum
+        var bestScale = scaleCandidates[bestIdx]
+        if (bestIdx > 0 && bestIdx < scaleCandidates.size - 1) {
+            val y0 = errors[bestIdx - 1]
+            val y1 = errors[bestIdx]
+            val y2 = errors[bestIdx + 1]
+            val denom = 2.0f * (y0 - 2.0f * y1 + y2)
+            if (abs(denom) > 1e-4f) {
+                val delta = (y0 - y2) / denom
+                val stepSize = (scaleCandidates[bestIdx + 1] - scaleCandidates[bestIdx - 1]) / 2.0f
+                bestScale = (bestScale + delta * stepSize).coerceIn(0.90f, 1.10f)
+            }
+        }
+
+        // Estimate pan translation with the refined scale
+        val panCandidatesX = intArrayOf(-6, -3, 0, 3, 6)
+        val panCandidatesY = intArrayOf(-4, -2, 0, 2, 4)
+        var bestDx = 0
+        var bestDy = 0
+        var minPanErr = Long.MAX_VALUE
+
+        for (dy in panCandidatesY) {
+            for (dx in panCandidatesX) {
+                var panDiff = 0L
+                var panCount = 0
+
+                var y = startY
+                while (y < endY) {
+                    val ry = y - cy
+                    val mappedY = (cy + bestScale * ry + dy).toInt()
+                    if (mappedY in 0 until height) {
+                        val prevRow = y * width
+                        val currRow = mappedY * width
+
+                        var x = startX
+                        while (x < endX) {
+                            val rx = x - cx
+                            val mappedX = (cx + bestScale * rx + dx).toInt()
+                            if (mappedX in 0 until width) {
+                                val pIdx = prevRow + x
+                                val cIdx = currRow + mappedX
+                                if (pIdx in prevLuma.indices && cIdx in currLuma.indices) {
+                                    val pVal = prevLuma[pIdx].toInt() and 0xFF
+                                    val cVal = currLuma[cIdx].toInt() and 0xFF
+                                    panDiff += abs(pVal - cVal)
+                                    panCount++
+                                }
+                            }
+                            x += step * 2
                         }
                     }
+                    y += step * 2
+                }
+
+                if (panCount > 0 && panDiff < minPanErr) {
+                    minPanErr = panDiff
+                    bestDx = dx
+                    bestDy = dy
                 }
             }
         }
 
-        if (displacementsX.isEmpty()) {
-            return FrameMotionDelta(0f, 0f, 1.0f)
-        }
-
-        displacementsX.sort()
-        displacementsY.sort()
-        val medianDx = displacementsX[(displacementsX.size / 2).coerceIn(0, displacementsX.size - 1)]
-        val medianDy = displacementsY[(displacementsY.size / 2).coerceIn(0, displacementsY.size - 1)]
-
-        var scaleDelta = 0.0f
-        var sumNum = 0f
-        var sumDen = 0f
-        for (i in radialNumerator.indices) {
-            sumNum += radialNumerator[i]
-            sumDen += radialDenominator[i]
-        }
-
-        if (sumDen > 0.001f) {
-            scaleDelta = sumNum / sumDen
-        }
-
-        val frameScale = 1.0f + scaleDelta
-
         return FrameMotionDelta(
-            deltaX = medianDx,
-            deltaY = medianDy,
-            scaleFactor = frameScale
+            deltaX = bestDx.toFloat(),
+            deltaY = bestDy.toFloat(),
+            scaleFactor = bestScale
         )
     }
 

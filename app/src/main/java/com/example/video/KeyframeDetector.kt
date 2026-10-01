@@ -6,10 +6,6 @@ import kotlin.math.abs
 
 object KeyframeDetector {
 
-    /**
-     * Reconstructs an optimized motion timeline from the raw keyframes extracted
-     * via MediaExtractor, identifying significant inflection points and curve transitions.
-     */
     fun reconstructFromExtractedKeyframes(
         extractedKeyframes: List<MotionKeyframe>,
         referenceDurationMs: Long
@@ -32,6 +28,13 @@ object KeyframeDetector {
         return reconstructKeyframes(rawSamples, referenceDurationMs)
     }
 
+    /**
+     * Reconstructs motion keyframes from time-series motion samples,
+     * reliably identifying all turning points:
+     * - Local maximums (zoom-in turning into zoom-out)
+     * - Local minimums (zoom-out turning into zoom-in)
+     * - Level-offs (entering or leaving hold states)
+     */
     fun reconstructKeyframes(
         rawSamples: List<RawMotionSample>,
         referenceDurationMs: Long
@@ -43,8 +46,9 @@ object KeyframeDetector {
             )
         }
 
-        // 1. Smooth raw samples with a 3-tap Gaussian moving window to suppress high-frequency noise
-        val smoothed = smoothSamples(rawSamples)
+        // Apply a gentle 3-tap moving window to reduce high-frequency sensor noise
+        // while strictly preserving all turning points and slopes
+        val smoothed = smoothSamplesPreservingExtrema(rawSamples)
         if (smoothed.isEmpty()) {
             return listOf(
                 MotionKeyframe(timestampMs = 0L, scale = 1.0f, positionX = 0.5f, positionY = 0.5f),
@@ -52,10 +56,9 @@ object KeyframeDetector {
             )
         }
 
-        // 2. Identify key inflection points:
         val keyframeCandidates = mutableListOf<MotionKeyframe>()
 
-        // Always include initial frame at 0ms
+        // 1. Initial keyframe at 0ms
         val firstSample = smoothed.first()
         keyframeCandidates.add(
             MotionKeyframe(
@@ -67,42 +70,50 @@ object KeyframeDetector {
             )
         )
 
-        // Find extrema and slope changes
+        // 2. Identify all extrema and slope reversals
         if (smoothed.size > 2) {
-            for (i in 1 until smoothed.size - 1) {
-                if (i - 1 !in smoothed.indices || i !in smoothed.indices || i + 1 !in smoothed.indices) continue
+            var lastAddedTimeMs = 0L
+            var lastAddedScale = firstSample.scale
+            var lastAddedPanX = firstSample.panX
+            var lastAddedPanY = firstSample.panY
 
+            for (i in 1 until smoothed.size - 1) {
                 val prev = smoothed[i - 1]
                 val curr = smoothed[i]
                 val next = smoothed[i + 1]
 
-                val scaleSlope1 = curr.scale - prev.scale
-                val scaleSlope2 = next.scale - curr.scale
+                val slopeBefore = curr.scale - prev.scale
+                val slopeAfter = next.scale - curr.scale
 
-                val panXSlope1 = curr.panX - prev.panX
-                val panXSlope2 = next.panX - curr.panX
+                val panXBefore = curr.panX - prev.panX
+                val panXAfter = next.panX - curr.panX
 
-                val panYSlope1 = curr.panY - prev.panY
-                val panYSlope2 = next.panY - curr.panY
+                val panYBefore = curr.panY - prev.panY
+                val panYAfter = next.panY - curr.panY
 
-                // Extrema check: scale slope changes sign (peak zoom or valley zoom)
-                val isScaleExtremum = (scaleSlope1 * scaleSlope2 < 0f) && (abs(scaleSlope1) > 0.015f || abs(scaleSlope2) > 0.015f)
+                // Peak turning point: scale was increasing, now decreasing (Zoom-in to Zoom-out)
+                val isPeakZoom = (slopeBefore > 0.005f && slopeAfter < -0.005f) ||
+                        (curr.scale >= prev.scale && curr.scale > next.scale && curr.scale - prev.scale > 0.01f)
 
-                // Large scale delta from last added keyframe
-                val lastKeyframe = keyframeCandidates.lastOrNull() ?: keyframeCandidates[0]
-                val deltaScaleFromLast = abs(curr.scale - lastKeyframe.scale)
-                val deltaPanFromLast = abs(curr.panX - lastKeyframe.positionX) + abs(curr.panY - lastKeyframe.positionY)
-                val deltaTimeFromLast = curr.timestampMs - lastKeyframe.timestampMs
+                // Valley turning point: scale was decreasing, now increasing (Zoom-out to Zoom-in)
+                val isValleyZoom = (slopeBefore < -0.005f && slopeAfter > 0.005f) ||
+                        (curr.scale <= prev.scale && curr.scale < next.scale && prev.scale - curr.scale > 0.01f)
 
-                // Pan slope reversal
-                val isPanExtremum = (panXSlope1 * panXSlope2 < 0f || panYSlope1 * panYSlope2 < 0f) &&
-                        (abs(panXSlope1) > 0.02f || abs(panYSlope1) > 0.02f)
+                // Pan extrema
+                val isPanXExtremum = (panXBefore * panXAfter < 0f) && (abs(panXBefore) > 0.015f || abs(panXAfter) > 0.015f)
+                val isPanYExtremum = (panYBefore * panYAfter < 0f) && (abs(panYBefore) > 0.015f || abs(panYAfter) > 0.015f)
 
-                val shouldAdd = (isScaleExtremum || isPanExtremum) && (deltaTimeFromLast >= 500L) ||
-                        (deltaScaleFromLast >= 0.12f && deltaTimeFromLast >= 600L) ||
-                        (deltaPanFromLast >= 0.10f && deltaTimeFromLast >= 800L)
+                val deltaScaleFromLast = abs(curr.scale - lastAddedScale)
+                val deltaPanFromLast = abs(curr.panX - lastAddedPanX) + abs(curr.panY - lastAddedPanY)
+                val deltaTimeFromLast = curr.timestampMs - lastAddedTimeMs
 
-                if (shouldAdd) {
+                // Add keyframe if turning point occurs or substantial movement has elapsed
+                val isTurningPoint = (isPeakZoom || isValleyZoom || isPanXExtremum || isPanYExtremum) && (deltaTimeFromLast >= 150L)
+                val isSignificantDelta = (deltaScaleFromLast >= 0.15f && deltaTimeFromLast >= 400L) ||
+                        (deltaPanFromLast >= 0.12f && deltaTimeFromLast >= 500L)
+                val isTimeIntervalSpacing = (deltaTimeFromLast >= 1800L && (deltaScaleFromLast > 0.05f || deltaPanFromLast > 0.05f))
+
+                if (isTurningPoint || isSignificantDelta || isTimeIntervalSpacing) {
                     keyframeCandidates.add(
                         MotionKeyframe(
                             timestampMs = curr.timestampMs,
@@ -112,16 +123,20 @@ object KeyframeDetector {
                             interpolation = InterpolationType.EASE_IN_OUT
                         )
                     )
+                    lastAddedTimeMs = curr.timestampMs
+                    lastAddedScale = curr.scale
+                    lastAddedPanX = curr.panX
+                    lastAddedPanY = curr.panY
                 }
             }
         }
 
-        // Always include terminal frame at referenceDurationMs
+        // 3. Final keyframe at referenceDurationMs
         val lastSample = smoothed.last()
         val finalTimestamp = referenceDurationMs.coerceAtLeast(lastSample.timestampMs)
-        val lastCand = keyframeCandidates.lastOrNull()
+        val lastCandidate = keyframeCandidates.lastOrNull()
 
-        if (lastCand == null || lastCand.timestampMs < finalTimestamp - 300L) {
+        if (lastCandidate == null || lastCandidate.timestampMs < finalTimestamp - 200L) {
             keyframeCandidates.add(
                 MotionKeyframe(
                     timestampMs = finalTimestamp,
@@ -131,26 +146,13 @@ object KeyframeDetector {
                     interpolation = InterpolationType.EASE_IN_OUT
                 )
             )
-        } else if (keyframeCandidates.isNotEmpty()) {
+        } else {
+            // Update terminal timestamp to exact video end
             val prevLast = keyframeCandidates.removeAt(keyframeCandidates.size - 1)
             keyframeCandidates.add(
-                prevLast.copy(timestampMs = finalTimestamp)
-            )
-        }
-
-        // If very few keyframes were detected, add midpoint anchor
-        if (keyframeCandidates.size <= 2 && smoothed.size >= 4) {
-            val midIdx = (smoothed.size / 2).coerceIn(0, smoothed.size - 1)
-            val midSample = smoothed[midIdx]
-            val insertIdx = 1.coerceIn(0, keyframeCandidates.size)
-            keyframeCandidates.add(
-                insertIdx,
-                MotionKeyframe(
-                    timestampMs = midSample.timestampMs,
-                    scale = roundToDecimals(midSample.scale, 2),
-                    positionX = roundToDecimals(midSample.panX, 3),
-                    positionY = roundToDecimals(midSample.panY, 3),
-                    interpolation = InterpolationType.SMOOTH
+                prevLast.copy(
+                    timestampMs = finalTimestamp,
+                    scale = roundToDecimals(lastSample.scale, 2)
                 )
             )
         }
@@ -158,31 +160,41 @@ object KeyframeDetector {
         return keyframeCandidates.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
     }
 
-    private fun smoothSamples(samples: List<RawMotionSample>): List<RawMotionSample> {
+    /**
+     * Noise smoothing that preserves turning points (peaks and valleys) without flattening extrema.
+     */
+    private fun smoothSamplesPreservingExtrema(samples: List<RawMotionSample>): List<RawMotionSample> {
         if (samples.size < 3) return samples
 
         val result = mutableListOf<RawMotionSample>()
         samples.firstOrNull()?.let { result.add(it) }
 
         for (i in 1 until samples.size - 1) {
-            if (i - 1 in samples.indices && i in samples.indices && i + 1 in samples.indices) {
-                val p = samples[i - 1]
-                val c = samples[i]
-                val n = samples[i + 1]
+            val p = samples[i - 1]
+            val c = samples[i]
+            val n = samples[i + 1]
 
-                val smoothedScale = p.scale * 0.25f + c.scale * 0.50f + n.scale * 0.25f
-                val smoothedPanX = p.panX * 0.25f + c.panX * 0.50f + n.panX * 0.25f
-                val smoothedPanY = p.panY * 0.25f + c.panY * 0.50f + n.panY * 0.25f
+            // If c is a peak or valley, do not average it away
+            val isPeak = c.scale > p.scale && c.scale > n.scale
+            val isValley = c.scale < p.scale && c.scale < n.scale
 
-                result.add(
-                    RawMotionSample(
-                        timestampMs = c.timestampMs,
-                        scale = smoothedScale,
-                        panX = smoothedPanX,
-                        panY = smoothedPanY
-                    )
-                )
+            val smoothedScale = if (isPeak || isValley) {
+                c.scale // preserve exact peak/valley value
+            } else {
+                p.scale * 0.20f + c.scale * 0.60f + n.scale * 0.20f
             }
+
+            val smoothedPanX = p.panX * 0.20f + c.panX * 0.60f + n.panX * 0.20f
+            val smoothedPanY = p.panY * 0.20f + c.panY * 0.60f + n.panY * 0.20f
+
+            result.add(
+                RawMotionSample(
+                    timestampMs = c.timestampMs,
+                    scale = smoothedScale,
+                    panX = smoothedPanX,
+                    panY = smoothedPanY
+                )
+            )
         }
 
         samples.lastOrNull()?.let { result.add(it) }

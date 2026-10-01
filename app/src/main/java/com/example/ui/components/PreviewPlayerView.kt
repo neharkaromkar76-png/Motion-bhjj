@@ -234,8 +234,24 @@ fun PreviewPlayerView(
             }
 
             // Real-time HUD overlay badge
+            var prevScaleState by remember { mutableStateOf(currentTransform.scale) }
+            val deltaScale = currentTransform.scale - prevScaleState
+            val zoomDirectionText = when {
+                deltaScale > 0.003f -> "↗ ZOOM IN"
+                deltaScale < -0.003f -> "↘ ZOOM OUT"
+                else -> "→ STEADY"
+            }
+            val zoomDirectionColor = when {
+                deltaScale > 0.003f -> StudioCyan
+                deltaScale < -0.003f -> KeyframeAmber
+                else -> Color.White.copy(alpha = 0.8f)
+            }
+            LaunchedEffect(currentTransform.scale) {
+                prevScaleState = currentTransform.scale
+            }
+
             Surface(
-                color = Color.Black.copy(alpha = 0.7f),
+                color = Color.Black.copy(alpha = 0.75f),
                 shape = RoundedCornerShape(8.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
                 modifier = Modifier
@@ -243,14 +259,25 @@ fun PreviewPlayerView(
                     .padding(10.dp)
             ) {
                 Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = if (previewMode == PreviewMode.AFTER_MOTION) "MOTION ACTIVE" else "ORIGINAL (STATIC)",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (previewMode == PreviewMode.AFTER_MOTION) StudioCyan else StudioViolet
+                        )
+                        if (previewMode == PreviewMode.AFTER_MOTION) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = zoomDirectionText,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = zoomDirectionColor
+                            )
+                        }
+                    }
                     Text(
-                        text = if (previewMode == PreviewMode.AFTER_MOTION) "MOTION ACTIVE" else "ORIGINAL (STATIC)",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (previewMode == PreviewMode.AFTER_MOTION) StudioCyan else StudioViolet
-                    )
-                    Text(
-                        text = "Zoom: ${(currentTransform.scale * 100).toInt()}%  Pan: ${String.format(java.util.Locale.US, "%.2f, %.2f", currentTransform.positionX, currentTransform.positionY)}",
+                        text = "Scale: ${String.format(java.util.Locale.US, "%.2fx", currentTransform.scale)} (${(currentTransform.scale * 100).toInt()}%) | Pan: ${String.format(java.util.Locale.US, "%.2f, %.2f", currentTransform.positionX, currentTransform.positionY)}",
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace,
                         color = Color.White

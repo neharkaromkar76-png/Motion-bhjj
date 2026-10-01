@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Diamond
+import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -50,7 +51,9 @@ import com.example.ui.theme.StudioSurfaceBorder
 import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.StudioViolet
 import com.example.utils.TimeFormatter
+import com.example.video.MotionDirection
 import com.example.video.MotionInterpolator
+import com.example.video.MotionTimeline
 
 @Composable
 fun KeyframeGraphView(
@@ -63,6 +66,18 @@ fun KeyframeGraphView(
     onAddKeyframeAtCurrentTime: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val safeDuration = durationMs.coerceAtLeast(1000L)
+    val timeline = remember(keyframes, safeDuration) {
+        MotionTimeline(safeDuration, keyframes)
+    }
+
+    val maxScale = remember(keyframes) {
+        keyframes.maxOfOrNull { it.scale }?.coerceAtLeast(1.4f) ?: 2.0f
+    }
+    val minScale = remember(keyframes) {
+        keyframes.minOfOrNull { it.scale }?.coerceAtMost(1.0f) ?: 1.0f
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -88,14 +103,14 @@ fun KeyframeGraphView(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "RECONSTRUCTED MOTION TIMELINE",
+                        text = "MOTION BLUEPRINT TIMELINE",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = KeyframeAmber
                     )
                 }
                 Text(
-                    text = "${keyframes.size} Keyframes Detected across ${(durationMs / 1000f).let { String.format(java.util.Locale.US, "%.2fs", it) }}",
+                    text = "${keyframes.size} Keyframes | Zoom In: ${timeline.zoomInCount} | Zoom Out: ${timeline.zoomOutCount}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -114,18 +129,60 @@ fun KeyframeGraphView(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Visual Graph Canvas
-        val safeDuration = durationMs.coerceAtLeast(1000L)
-        val maxScale = remember(keyframes) {
-            keyframes.maxOfOrNull { it.scale }?.coerceAtLeast(1.5f) ?: 2.0f
+        // Live direction status banner
+        val currentDir = timeline.getCurrentDirection(currentPositionMs)
+        val dirColor = when (currentDir) {
+            MotionDirection.ZOOM_IN -> StudioCyan
+            MotionDirection.ZOOM_OUT -> KeyframeAmber
+            MotionDirection.HOLD -> StudioViolet
+        }
+        val dirIcon = when (currentDir) {
+            MotionDirection.ZOOM_IN -> "↗ ZOOM IN"
+            MotionDirection.ZOOM_OUT -> "↘ ZOOM OUT"
+            MotionDirection.HOLD -> "→ HOLD"
         }
 
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(6.dp))
+                .background(dirColor.copy(alpha = 0.15f))
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(dirColor)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "MOTION STATE: $dirIcon",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = dirColor
+                )
+            }
+            Text(
+                text = "Scale: ${String.format(java.util.Locale.US, "%.2fx", (keyframes.find { it.timestampMs <= currentPositionMs }?.scale ?: 1.0f))} (Range: ${String.format(java.util.Locale.US, "%.2f - %.2fx", minScale, maxScale)})",
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = Color.White.copy(alpha = 0.8f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Visual Graph Canvas
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(110.dp)
+                .height(115.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(StudioSurfaceElevated)
                 .pointerInput(keyframes, safeDuration) {
@@ -156,11 +213,11 @@ fun KeyframeGraphView(
                 val w = size.width
                 val h = size.height
 
-                // Grid lines (horizontal for scale levels 1.0, 1.5, 2.0)
                 val baseScaleY = h * 0.85f
                 val topScaleY = h * 0.15f
+                val scaleSpan = (maxScale - minScale).coerceAtLeast(0.1f)
 
-                // Draw baseline (1.0x scale)
+                // Baseline 1.0x line
                 drawLine(
                     color = Color.White.copy(alpha = 0.15f),
                     start = Offset(0f, baseScaleY),
@@ -168,18 +225,17 @@ fun KeyframeGraphView(
                     strokeWidth = 1.dp.toPx()
                 )
 
-                // Draw motion continuous curve
+                // Draw continuous transform curve showing scale rises (zoom in) and falls (zoom out)
                 if (keyframes.isNotEmpty()) {
                     val curvePath = Path()
-                    val steps = 100
+                    val steps = 150
                     for (step in 0..steps) {
                         val tFrac = step / steps.toFloat()
                         val sampleTime = (tFrac * safeDuration).toLong()
                         val motion = MotionInterpolator.interpolate(keyframes, sampleTime)
 
                         val x = tFrac * w
-                        // Map scale 1.0 -> baseScaleY, maxScale -> topScaleY
-                        val normScale = ((motion.scale - 1.0f) / (maxScale - 1.0f).coerceAtLeast(0.1f)).coerceIn(0f, 1.2f)
+                        val normScale = ((motion.scale - minScale) / scaleSpan).coerceIn(0f, 1.2f)
                         val y = baseScaleY - normScale * (baseScaleY - topScaleY)
 
                         if (step == 0) {
@@ -197,17 +253,16 @@ fun KeyframeGraphView(
                     )
                 }
 
-                // Draw Keyframe Diamond nodes
+                // Draw Keyframe Diamond nodes at peaks, valleys, and turning points
                 for (kf in keyframes) {
                     val kfX = (kf.timestampMs.toFloat() / safeDuration.toFloat()) * w
-                    val normScale = ((kf.scale - 1.0f) / (maxScale - 1.0f).coerceAtLeast(0.1f)).coerceIn(0f, 1.2f)
+                    val normScale = ((kf.scale - minScale) / scaleSpan).coerceIn(0f, 1.2f)
                     val kfY = baseScaleY - normScale * (baseScaleY - topScaleY)
 
                     val isSelected = selectedKeyframe?.id == kf.id
                     val nodeColor = if (isSelected) KeyframeAmberBright else KeyframeAmber
                     val nodeRadius = if (isSelected) 8.dp.toPx() else 5.dp.toPx()
 
-                    // Diamond shape path
                     val diamond = Path().apply {
                         moveTo(kfX, kfY - nodeRadius)
                         lineTo(kfX + nodeRadius, kfY)
@@ -228,6 +283,49 @@ fun KeyframeGraphView(
                     end = Offset(playheadX, h),
                     strokeWidth = 2.dp.toPx()
                 )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // MOTION DIRECTION TIMELINE TRACK (IN, OUT, HOLD intervals)
+        if (timeline.segments.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(20.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Black.copy(alpha = 0.4f))
+            ) {
+                for (seg in timeline.segments) {
+                    val weight = (seg.durationMs.toFloat() / safeDuration.toFloat()).coerceAtLeast(0.01f)
+                    val segColor = when (seg.direction) {
+                        MotionDirection.ZOOM_IN -> StudioCyan.copy(alpha = 0.7f)
+                        MotionDirection.ZOOM_OUT -> KeyframeAmber.copy(alpha = 0.7f)
+                        MotionDirection.HOLD -> Color.Gray.copy(alpha = 0.3f)
+                    }
+                    val segText = when (seg.direction) {
+                        MotionDirection.ZOOM_IN -> "IN"
+                        MotionDirection.ZOOM_OUT -> "OUT"
+                        MotionDirection.HOLD -> "—"
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(weight)
+                            .height(20.dp)
+                            .background(segColor)
+                            .border(0.5.dp, Color.Black.copy(alpha = 0.3f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = segText,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+                }
             }
         }
 

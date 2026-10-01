@@ -189,4 +189,69 @@ class MotionTransferUnitTest {
         val after = MotionInterpolator.interpolate(keyframes, 99999L)
         assertEquals(1.4f, after.scale, 0.01f)
     }
+
+    @Test
+    fun testSyntheticMotionCurve_zoomInAndZoomOutSequence() {
+        // Synthetic motion curve requested by user:
+        // 0s = 1.00
+        // 1s = 1.25
+        // 2s = 1.50 (Peak 1)
+        // 3s = 1.25 (Zoom out!)
+        // 4s = 1.00 (Valley 1)
+        // 5s = 1.40
+        // 6s = 1.70 (Peak 2)
+        // 7s = 1.30 (Zoom out!)
+        // 8s = 1.00 (Valley 2)
+        val syntheticSamples = listOf(
+            RawMotionSample(0L, 1.00f, 0.5f, 0.5f),
+            RawMotionSample(1000L, 1.25f, 0.5f, 0.5f),
+            RawMotionSample(2000L, 1.50f, 0.5f, 0.5f),
+            RawMotionSample(3000L, 1.25f, 0.5f, 0.5f),
+            RawMotionSample(4000L, 1.00f, 0.5f, 0.5f),
+            RawMotionSample(5000L, 1.40f, 0.5f, 0.5f),
+            RawMotionSample(6000L, 1.70f, 0.5f, 0.5f),
+            RawMotionSample(7000L, 1.30f, 0.5f, 0.5f),
+            RawMotionSample(8000L, 1.00f, 0.5f, 0.5f)
+        )
+
+        val keyframes = KeyframeDetector.reconstructKeyframes(syntheticSamples, 8000L)
+        val timeline = MotionTimeline(referenceDurationMs = 8000L, keyframes = keyframes)
+
+        // 1. Must detect both Zoom In and Zoom Out
+        assertTrue("Timeline must detect Zoom In", timeline.hasZoomIn)
+        assertTrue("Timeline must detect Zoom Out", timeline.hasZoomOut)
+        assertTrue("Timeline must have at least 1 Zoom In event", timeline.zoomInCount >= 1)
+        assertTrue("Timeline must have at least 1 Zoom Out event", timeline.zoomOutCount >= 1)
+
+        // 2. Sample points along timeline:
+        val scale0s = timeline.getTransformForOriginalTime(0L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale1s = timeline.getTransformForOriginalTime(1000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale2s = timeline.getTransformForOriginalTime(2000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale3s = timeline.getTransformForOriginalTime(3000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale4s = timeline.getTransformForOriginalTime(4000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale5s = timeline.getTransformForOriginalTime(5000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale6s = timeline.getTransformForOriginalTime(6000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale7s = timeline.getTransformForOriginalTime(7000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+        val scale8s = timeline.getTransformForOriginalTime(8000L, 8000L, TimelineMappingMode.EXACT_TIME).scale
+
+        // Expected result:
+        // 0-2s ZOOM IN: scale rises
+        assertTrue("0-2s must zoom in: scale2s ($scale2s) > scale0s ($scale0s)", scale2s > scale0s + 0.3f)
+
+        // 2-4s ZOOM OUT: scale decreases
+        assertTrue("2-4s must zoom out: scale2s ($scale2s) > scale3s ($scale3s)", scale2s > scale3s)
+        assertTrue("2-4s must zoom out: scale3s ($scale3s) > scale4s ($scale4s)", scale3s > scale4s)
+        assertTrue("2-4s must reach near 1.0 at 4s ($scale4s)", scale4s < 1.15f)
+
+        // 4-6s ZOOM IN: scale rises again
+        assertTrue("4-6s must zoom in: scale6s ($scale6s) > scale4s ($scale4s)", scale6s > scale4s + 0.4f)
+
+        // 6-8s ZOOM OUT: scale decreases again
+        assertTrue("6-8s must zoom out: scale6s ($scale6s) > scale7s ($scale7s)", scale6s > scale7s)
+        assertTrue("6-8s must zoom out: scale7s ($scale7s) > scale8s ($scale8s)", scale7s > scale8s)
+        assertTrue("6-8s must reach near 1.0 at 8s ($scale8s)", scale8s < 1.15f)
+
+        // Verify NON-MONOTONIC curve (not a single positive zoom)
+        assertTrue("Curve is non-monotonic", scale2s > scale4s && scale6s > scale4s && scale6s > scale8s)
+    }
 }
