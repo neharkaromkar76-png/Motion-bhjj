@@ -22,13 +22,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Make Gradle Wrapper executable
         run: chmod +x gradlew
@@ -36,8 +38,10 @@ jobs:
       - name: Run Unit Tests
         run: ./gradlew testDebugUnitTest --stacktrace --info
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --info
+      - name: Clean & Build Debug APK
+        run: |
+          ./gradlew clean
+          ./gradlew assembleDebug --stacktrace --info
 
       - name: Verify Generated APK
         run: |
