@@ -1,0 +1,6 @@
+{
+  "name": "Keyframe Motion Transfer",
+  "description": "Reconstructs visible camera motion and zoom timelines from reference videos and transfers them to original videos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
